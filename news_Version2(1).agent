@@ -1,0 +1,147 @@
+"""Daily US trade digest email.
+
+Runs every morning at 07:00 America/New_York and emails a summary of the most
+important US trade developments involving China, Mexico, the EU, Germany and
+other major trading partners.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+import smtplib
+import sys
+from email.message import EmailMessage
+from typing import Iterable
+from urllib.parse import quote_plus
+from xml.etree import ElementTree as ET
+from zoneinfo import ZoneInfo
+
+import requests
+from anthropic import Anthropic
+
+TZ = ZoneInfo("America/New_York")
+RECIPIENT = "maik@boeres.de"
+MODEL = "claude-sonnet-4-20250514"
+
+GOOGLE_NEWS_BASE = "https://news.google.com/rss/search"
+
+QUERY_GROUPS = [
+    "US China trade tariff",
+    "US Mexico trade tariff",
+    "US EU trade tariff",
+    "US trade with China",
+    "US trade with Mexico",
+    "US trade with EU",
+    "trade sanctions China US",
+    "tariffs and trade Mexico",
+    "EU US trade sanctions",
+    "US trade with Germany",
+    "US trade with Canada",
+    "US trade with Japan",
+    "US trade with South Korea",
+    "US trade with India",
+    "US trade with Brazil",
+    "US trade with Vietnam",
+    "US trade with Taiwan",
+]
+
+def should_run(now: dt.datetime) -> bool:
+    return bool(os.getenv("FORCE")) or (now.tzinfo is not None and now.astimezone(TZ).hour == 7)
+
+def fetch_google_news(query: str, limit: int = 8) -> list[dict[str, str]]:
+    q = quote_plus(query)
+    url = f"{GOOGLE_NEWS_BASE}?q={q}&hl=en-US&gl=US&ceid=US:en"
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+
+    root = ET.fromstring(resp.content)
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for item in root.findall("./channel/item")[:limit * 3]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        if not title or not link or link in seen:
+            continue
+        seen.add(link)
+        items.append({"title": title, "link": link, "published": pub_date})
+        if len(items) >= limit:
+            break
+    return items
+
+def collect_news() -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for query in QUERY_GROUPS:
+        for entry in fetch_google_news(query, limit=5):
+            key = entry["link"]
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(entry)
+    return items[:30]
+
+def summarize_news(items: Iterable[dict[str, str]], today: dt.date) -> str:
+    text = "\n".join(
+        f"- {item['title']}\n  {item['link']}\n  {item['published']}" for item in items
+    )
+
+    client = Anthropic()
+    prompt = f"""Heute ist {today:%d.%m.%Y}. Schreibt einen kurzen deutschen Morning-Digest zu US-Handelsnachrichten.
+
+Themen: USA mit China, Mexiko, EU, Deutschland und anderen wichtigen Handelspartnern.
+
+Verwende ausschließlich die folgenden aktuellen Meldungen:
+{text}
+
+Aufgabe:
+- Beginne mit 2-3 Sätzen "Das Wichtigste heute"
+- Danach 5-7 kurze Punkte mit jeweils 1-2 Sätzen
+- Jede Meldung soll eine echte Neuigkeit und keine Vermutung sein
+- Wenn kaum etwas Neues vorliegt, sage das klar
+- In den Punkten bitte immer Quelle/Link angeben
+- Zum Schluss ein Abschnitt "Heute zu beobachten" mit maximal 3 Punkten
+- Antworte auf Deutsch.
+"""
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "\n".join(
+        block.text for block in response.content if getattr(block, "type", None) == "text"
+    ).strip()
+
+def send_email(subject: str, body: str) -> None:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = os.environ["SMTP_USER"]
+    msg["To"] = RECIPIENT
+    msg.set_content(body)
+
+    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.getenv("SMTP_PORT", "465"))
+    with smtplib.SMTP_SSL(host, port) as smtp:
+        smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+        smtp.send_message(msg)
+
+def main() -> None:
+    now = dt.datetime.now(TZ)
+    if not should_run(now):
+        print(f"Washington {now:%H:%M}: skip")
+        sys.exit(0)
+
+    items = collect_news()
+    if not items:
+        body = "Keine relevanten US-Handelsmeldungen in den letzten 24 Stunden gefunden."
+    else:
+        body = summarize_news(items, now.date())
+
+    subject = f"US-Handelspolitik – {now:%d.%m.%Y}"
+    send_email(subject, body)
+    print("Digest sent.")
+
+if __name__ == "__main__":
+    main()
